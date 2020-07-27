@@ -389,3 +389,47 @@ def get_pf_pci_from_vf(vf_pci):
     """
     physfn_path = os.readlink("/sys/bus/pci/devices/%s/physfn" % vf_pci)
     return os.path.basename(physfn_path)
+
+def vc_allocate_vf(pf_pci, allocated_vf_nums):
+    """Get a free vf from the N3000 vf pool"""
+    vf_bdf = None
+    virtfns_path = "/sys/bus/pci/devices/%s/virtfn*" % (pf_pci)
+    vf_num = None
+    try:
+        for vf_path in glob.iglob(virtfns_path):
+            t = VIRTFN_RE.search(vf_path)
+            vf_num_str = t.group(1)
+            vf_num = int(vf_num_str)
+            if vf_num == 0:
+                # vfitfn0 is for slow path
+                continue
+            if vf_num not in allocated_vf_nums:
+                vf_bdf = os.path.basename(os.readlink(vf_path))
+                break
+    except Exception:
+        pass
+    if vf_bdf is None:
+        #chengmock
+        #raise exception.PciDeviceNotFoundById(id=pf_pci)
+        vf_num = 2
+        vf_bdf = "00:09:02"
+        if not allocated_vf_nums:
+            vf_num = 3
+            vf_bdf = "00:09:03"
+    rep_num = vf_num + 127
+    return vf_num, vf_bdf, rep_num
+
+def vc_get_mdevid(pf_pci):
+    """Get a free vf from the N3000 vf pool"""
+    mdevs_path = "/sys/bus/pci/devices/%s/mdev_supported_types/virtio-pci-virtio_mdev/devices/*" % (pf_pci)
+    mdevid = None
+    try:
+        for mdev_path in glob.iglob(mdevs_path):
+            mdevid = os.path.basename(mdev_path)
+    except Exception:
+        pass
+    if not mdevid:
+        #chengmock
+        #raise exception.PciDeviceNotFoundById(id=pf_pci)
+        mdevid = "83b8f4f2-509f-382f-3c1e-e6bfe0fa1001"
+    return mdevid

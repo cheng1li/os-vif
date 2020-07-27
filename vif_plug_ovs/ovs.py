@@ -18,6 +18,7 @@
 #    under the License.
 
 import sys
+import re
 
 from os_vif.internal.ip.api import ip as ip_lib
 from os_vif import objects
@@ -46,6 +47,7 @@ class OvsPlugin(plugin.PluginBase):
     NIC_NAME_LEN = 14
 
     CONFIG_OPTS = (
+        # option group name is "os_vif_ovs"
         cfg.IntOpt('network_device_mtu',
                    default=1500,
                    help='MTU setting for network interface.',
@@ -82,7 +84,10 @@ class OvsPlugin(plugin.PluginBase):
         cfg.BoolOpt('isolate_vif', default=False,
                     help='Controls if VIF should be isolated when plugged '
                     'to the ovs bridge. This should only be set to True '
-                    'when using the neutron ovs ml2 agent.')
+                    'when using the neutron ovs ml2 agent.'),
+        cfg.StrOpt('vc_pf_bdf', default="", help='the N3000 pf bdf'),
+        cfg.BoolOpt('vc_enabled', default=False,
+                    help='enable N3000 ovs-dpdk offload')
     )
 
     def __init__(self, config):
@@ -194,6 +199,41 @@ class OvsPlugin(plugin.PluginBase):
         self._create_vif_port(
             vif, vif_name, instance_info, **args)
 
+    def _plug_vhostuser_vc(self, vif, instance_info):
+        self.ovsdb.ensure_ovs_bridge(
+            vif.network.bridge, self._get_vif_datapath_type(
+                vif, datapath=constants.OVS_DATAPATH_NETDEV))
+        vif_name = OvsPlugin.gen_port_name(
+            constants.OVS_VDPA_PREFIX, vif.id)
+        args = {'interface_type': "dpdk"}
+        options = {}
+        other_config = self.ovsdb.ovsdb.db_get("Open_vSwitch", ".",
+                                               "other_config").execute()
+        allocated_vf_nums = other_config.get("used-vfs", '[]')
+        allocated_vf_nums = eval(allocated_vf_nums)
+        vf_num, vf_bdf, rep_num = linux_net.vc_allocate_vf(
+            self.config.vc_pf_bdf, allocated_vf_nums)
+        #options["vdpa-accelerator-devargs"] = vf_bdf
+        #options["vdpa-socket-path"] = vif.path
+        options["dpdk-devargs"] = "{mdev},representor=[{rep_num}],vf_bdf={vf_bdf},vdpa=1,sw-live-migration=0,iface={socket_path},client-mode=1".format(
+            mdev=linux_net.vc_get_mdevid(self.config.vc_pf_bdf),
+            rep_num=rep_num,
+            vf_bdf=vf_bdf,
+            socket_path=vif.path)
+        mtu = self._get_mtu(vif)
+        self.ovsdb.create_ovs_vif_port(
+            vif.network.bridge,
+            vif_name,
+            vif.port_profile.interface_id,
+            vif.address, instance_info.uuid,
+            mtu,
+            options=options,
+            **args)
+        allocated_vf_nums.append(vf_num)
+        self.ovsdb.ovsdb.db_set(
+            "Open_vSwitch", ".",
+            ("other_config:used-vfs", str(allocated_vf_nums))).execute()
+
     def _plug_bridge(self, vif, instance_info):
         """Plug using hybrid strategy
 
@@ -294,7 +334,10 @@ class OvsPlugin(plugin.PluginBase):
             else:
                 self._plug_vif_windows(vif, instance_info)
         elif isinstance(vif, objects.vif.VIFVHostUser):
-            self._plug_vhostuser(vif, instance_info)
+            if self.config.vc_enabled:
+                self._plug_vhostuser_vc(vif, instance_info)
+            else:
+                self._plug_vhostuser(vif, instance_info)
         elif isinstance(vif, objects.vif.VIFHostDevice):
             self._plug_vf(vif, instance_info)
 
@@ -302,6 +345,31 @@ class OvsPlugin(plugin.PluginBase):
         self.ovsdb.delete_ovs_vif_port(vif.network.bridge,
             OvsPlugin.gen_port_name(
                 constants.OVS_VHOSTUSER_PREFIX,
+                vif.id))
+
+    def _unplug_vhostuser_vc(self, vif, instance_info):
+        iface_options = self.ovsdb.ovsdb.db_get(
+            "Interface",
+            OvsPlugin.gen_port_name(constants.OVS_VDPA_PREFIX, vif.id),
+            "options").execute()
+        dpdk_devargs = iface_options.get("dpdk-devargs", "") if iface_options else ""
+        m = re.search(r'(?<=representor=\[)\d+', dpdk_devargs)
+        representor = m.group(0) if m else None
+        if representor:
+            representor = int(representor)
+            vf_num = representor - 127
+            other_config = self.ovsdb.ovsdb.db_get("Open_vSwitch", ".",
+                                                   "other_config").execute()
+            allocated_vf_nums = other_config.get("used-vfs", '[]')
+            allocated_vf_nums = eval(allocated_vf_nums)
+            if vf_num in allocated_vf_nums:
+                allocated_vf_nums.remove(vf_num)
+            self.ovsdb.ovsdb.db_set(
+                "Open_vSwitch", ".",
+                ("other_config:used-vfs", str(allocated_vf_nums))).execute()
+        self.ovsdb.delete_ovs_vif_port(vif.network.bridge,
+            OvsPlugin.gen_port_name(
+                constants.OVS_VDPA_PREFIX,
                 vif.id))
 
     def _unplug_bridge(self, vif, instance_info):
@@ -369,6 +437,9 @@ class OvsPlugin(plugin.PluginBase):
             else:
                 self._unplug_vif_windows(vif, instance_info)
         elif isinstance(vif, objects.vif.VIFVHostUser):
-            self._unplug_vhostuser(vif, instance_info)
+            if self.config.vc_enabled:
+                self._unplug_vhostuser_vc(vif, instance_info)
+            else:
+                self._unplug_vhostuser(vif, instance_info)
         elif isinstance(vif, objects.vif.VIFHostDevice):
             self._unplug_vf(vif)
